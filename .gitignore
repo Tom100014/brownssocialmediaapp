@@ -1,0 +1,52 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Secrets
+*credentials*
+*token*
+*secret*
+*.key
+*.pem
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build
+.next/
+dist/
+build/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Video files (large)
+videos/
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Uploads
+uploads/
+temp/
+tmp/
+
+# Cache
+.cache/
+.eslintcache

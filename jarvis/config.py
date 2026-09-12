@@ -34,9 +34,13 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- LLM-Provider ---------------------------------------------------
-    anthropic_api_key: SecretStr = Field(..., description="API-Key für Claude (Sonnet)")
-    google_api_key: SecretStr = Field(..., description="API-Key für Gemini (Flash)")
+    # --- LLM-Provider -----------------------------------------------------
+    # Optional: Die eigentliche Quelle der Wahrheit für API-Keys ist ab jetzt
+    # der verschlüsselte Connector-Store (siehe connectors_manager.py), der
+    # zur Laufzeit über die API gepflegt werden kann. Diese Felder dienen nur
+    # noch als Fallback für den allerersten Start / lokale Entwicklung.
+    anthropic_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für Claude (Sonnet)")
+    google_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für Gemini (Flash)")
 
     claude_model: str = Field(
         default="claude-3-5-sonnet-20241022",
@@ -48,8 +52,8 @@ class Settings(BaseSettings):
     )
 
     # --- Sprachein-/ausgabe ----------------------------------------------
-    deepgram_api_key: SecretStr = Field(..., description="API-Key für Deepgram STT")
-    elevenlabs_api_key: SecretStr = Field(..., description="API-Key für ElevenLabs TTS")
+    deepgram_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für Deepgram STT")
+    elevenlabs_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für ElevenLabs TTS")
     elevenlabs_voice_id: str = Field(
         default="21m00Tcm4TlvDq8ikWAM",
         description="Standard-Voice-ID für die TTS-Ausgabe",
@@ -78,7 +82,17 @@ class Settings(BaseSettings):
     # --- Sonstiges -------------------------------------------------------
     log_level: str = Field(default="INFO")
     weather_api_key: SecretStr | None = Field(
-        default=None, description="Optionaler API-Key für Wetterabfragen"
+        default=None, description="Fallback-API-Key für Wetterabfragen"
+    )
+
+    # --- Connector-Store ----------------------------------------------------
+    jarvis_master_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Fernet-Schlüssel zur Verschlüsselung gespeicherter Connector-Credentials. "
+            "Falls nicht gesetzt, wird beim ersten Start automatisch einer erzeugt und "
+            "unter data/master.key persistiert (für Produktivbetrieb: per Env setzen!)."
+        ),
     )
 
     @field_validator("log_level")

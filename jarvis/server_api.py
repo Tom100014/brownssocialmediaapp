@@ -20,10 +20,16 @@ import logging
 import uuid
 from typing import Any, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
+from pydantic import BaseModel, Field
 
 from config import settings
+from connectors_manager import (
+    ConnectorNotFoundError,
+    ConnectorValidationError,
+    connectors_manager,
+    list_schemas,
+)
 
 logger = logging.getLogger("jarvis.server_api")
 
@@ -110,6 +116,142 @@ def enqueue_command(action_id: str, parameters: dict[str, Any]) -> str:
     command_uuid = str(uuid.uuid4())
     _command_queue[command_uuid] = PendingCommand(action_id=action_id, parameters=parameters)
     return command_uuid
+
+
+# --- Connector-Verwaltung -----------------------------------------------
+#
+# Hier werden ALLE externen Anbindungen (LLM-Provider, Voice-APIs, Kalender,
+# Mail, Musik, Wetter, generische Webhooks, ...) zentral gespeichert und
+# konfiguriert. Secrets liegen verschlüsselt in SQLite (siehe storage.py) und
+# werden über die API niemals im Klartext zurückgegeben.
+
+
+class ConnectorUpsertRequest(BaseModel):
+    connector_type: str = Field(..., description="z. B. 'anthropic', 'google_calendar', 'weather'")
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class ConnectorResponse(BaseModel):
+    name: str
+    connector_type: str
+    credentials: dict[str, Any]
+    config: dict[str, Any]
+    enabled: bool
+    created_at: str
+    updated_at: str
+
+
+@app.get("/connectors/schemas", dependencies=[Depends(require_auth)])
+async def get_connector_schemas() -> list[dict[str, Any]]:
+    """Liefert alle bekannten Connector-Typen inkl. benötigter Felder - z. B.
+    damit eine Admin-UI dynamisch ein Formular pro Connector rendern kann."""
+    return list_schemas()
+
+
+@app.get("/connectors", response_model=list[ConnectorResponse], dependencies=[Depends(require_auth)])
+async def list_connectors() -> list[dict[str, Any]]:
+    return [record.redacted() for record in connectors_manager.list_connectors()]
+
+
+@app.get("/connectors/{name}", response_model=ConnectorResponse, dependencies=[Depends(require_auth)])
+async def get_connector(name: str) -> dict[str, Any]:
+    record = connectors_manager.get_connector(name)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Connector '{name}' nicht gefunden.")
+    return record.redacted()
+
+
+@app.put("/connectors/{name}", response_model=ConnectorResponse, dependencies=[Depends(require_auth)])
+async def upsert_connector(name: str, request: ConnectorUpsertRequest) -> dict[str, Any]:
+    """Legt einen Connector an oder aktualisiert ihn (voller Ersatz der Credentials).
+    Damit lässt sich z. B. der Anthropic-Key rotieren, ohne den Server neu zu starten."""
+    try:
+        record = connectors_manager.upsert_connector(
+            name=name,
+            connector_type=request.connector_type,
+            credentials=request.credentials,
+            config=request.config,
+            enabled=request.enabled,
+        )
+    except ConnectorValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    return record.redacted()
+
+
+@app.delete("/connectors/{name}", dependencies=[Depends(require_auth)])
+async def delete_connector(name: str) -> dict[str, str]:
+    try:
+        connectors_manager.delete_connector(name)
+    except ConnectorNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"status": "deleted"}
+
+
+@app.post("/connectors/{name}/enable", dependencies=[Depends(require_auth)])
+async def set_connector_enabled(name: str, enabled: bool = Body(..., embed=True)) -> dict[str, Any]:
+    record = connectors_manager.get_connector(name)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Connector '{name}' nicht gefunden.")
+    updated = connectors_manager.upsert_connector(
+        name=name,
+        connector_type=record.connector_type,
+        credentials=record.credentials,
+        config=record.config,
+        enabled=enabled,
+    )
+    return updated.redacted()
+
+
+@app.post("/connectors/{name}/test", dependencies=[Depends(require_auth)])
+async def test_connector(name: str) -> dict[str, Any]:
+    """Führt einen minimalen Live-Check gegen den externen Dienst aus, um
+    Credentials zu verifizieren, ohne dass man erst eine echte Anfrage über
+    /chat schicken muss."""
+    record = connectors_manager.get_connector(name)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Connector '{name}' nicht gefunden.")
+
+    if record.connector_type == "anthropic":
+        import anthropic
+
+        try:
+            client = anthropic.AsyncAnthropic(api_key=record.credentials.get("api_key", ""))
+            await client.messages.create(
+                model=settings.claude_model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            return {"status": "ok"}
+        except Exception as exc:
+            return {"status": "error", "detail": str(exc)}
+
+    if record.connector_type == "google_gemini":
+        import google.generativeai as genai
+
+        try:
+            genai.configure(api_key=record.credentials.get("api_key", ""))
+            model = genai.GenerativeModel(settings.gemini_model)
+            await model.generate_content_async("ping")
+            return {"status": "ok"}
+        except Exception as exc:
+            return {"status": "error", "detail": str(exc)}
+
+    return {"status": "not_implemented", "detail": f"Kein Live-Test für Typ '{record.connector_type}' verfügbar."}
+
+
+# --- Allgemeine Einstellungen --------------------------------------------
+
+
+@app.get("/settings", dependencies=[Depends(require_auth)])
+async def get_settings_endpoint() -> dict[str, Any]:
+    return connectors_manager.get_all_settings()
+
+
+@app.put("/settings", dependencies=[Depends(require_auth)])
+async def update_settings_endpoint(values: dict[str, Any]) -> dict[str, Any]:
+    return connectors_manager.update_settings(values)
 
 
 @app.get("/health")

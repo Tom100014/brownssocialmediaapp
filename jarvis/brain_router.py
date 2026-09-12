@@ -33,6 +33,7 @@ import google.generativeai as genai
 from anthropic.types import Message as AnthropicMessage
 
 from config import CONTEXT_DIR, settings
+from connectors_manager import connectors_manager
 
 logger = logging.getLogger("jarvis.brain_router")
 
@@ -133,9 +134,10 @@ def classify_complexity(user_input: str, tools_available: bool) -> ModelTarget:
     Grundsatz: im Zweifel Richtung Sonnet, da Fehlrouting nach Flash bei
     tatsächlichem Tool-Bedarf eine zweite Roundtrip-Latenz erzeugt.
     """
-    if settings.routing_mode == "always_flash":
+    routing_mode = connectors_manager.get_setting("routing_mode", settings.routing_mode)
+    if routing_mode == "always_flash":
         return ModelTarget.FLASH
-    if settings.routing_mode == "always_sonnet":
+    if routing_mode == "always_sonnet":
         return ModelTarget.SONNET
 
     normalized = user_input.lower().strip()
@@ -171,12 +173,39 @@ class BrainRouter:
         self._tool_executor = tool_executor
         self._max_tool_iterations = max_tool_iterations
 
-        self._anthropic = anthropic.AsyncAnthropic(
-            api_key=settings.anthropic_api_key.get_secret_value()
-        )
+        # Clients werden lazy (und bei jeder Anfrage neu aufgelöst) gebaut, da
+        # Keys sich über den Connector-Store (server_api.py: /connectors)
+        # jederzeit ändern können, ohne dass der Server neu gestartet werden muss.
+        self._anthropic_client_cache: tuple[str, anthropic.AsyncAnthropic] | None = None
 
-        genai.configure(api_key=settings.google_api_key.get_secret_value())
-        self._gemini = genai.GenerativeModel(settings.gemini_model)
+    def _resolve_anthropic_client(self) -> anthropic.AsyncAnthropic:
+        api_key = connectors_manager.get_credential("anthropic", "api_key") or (
+            settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else None
+        )
+        if not api_key:
+            raise ProviderError(
+                "Kein Anthropic-API-Key konfiguriert. Bitte Connector 'anthropic' über "
+                "POST /connectors anlegen."
+            )
+        if self._anthropic_client_cache is not None and self._anthropic_client_cache[0] == api_key:
+            return self._anthropic_client_cache[1]
+
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        self._anthropic_client_cache = (api_key, client)
+        return client
+
+    def _resolve_gemini_model(self) -> genai.GenerativeModel:
+        api_key = connectors_manager.get_credential("google_gemini", "api_key") or (
+            settings.google_api_key.get_secret_value() if settings.google_api_key else None
+        )
+        if not api_key:
+            raise ProviderError(
+                "Kein Gemini-API-Key konfiguriert. Bitte Connector 'google_gemini' über "
+                "POST /connectors anlegen."
+            )
+        genai.configure(api_key=api_key)
+        model_name = connectors_manager.get_setting("gemini_model", settings.gemini_model)
+        return genai.GenerativeModel(model_name)
 
     async def route(
         self,
@@ -220,10 +249,11 @@ class BrainRouter:
     async def _call_flash(self, user_input: str) -> BrainResponse:
         system_fragment = self._context_loader.as_system_prompt_fragment()
         prompt = f"{system_fragment}\n\nNutzeranfrage: {user_input}".strip()
+        gemini_model = self._resolve_gemini_model()
 
         try:
             result = await asyncio.wait_for(
-                self._gemini.generate_content_async(prompt),
+                gemini_model.generate_content_async(prompt),
                 timeout=15.0,
             )
         except asyncio.TimeoutError as exc:
@@ -251,11 +281,13 @@ class BrainRouter:
 
         messages: list[dict[str, Any]] = [*conversation_history, {"role": "user", "content": user_input}]
         tool_calls_made: list[str] = []
+        anthropic_client = self._resolve_anthropic_client()
+        claude_model = connectors_manager.get_setting("claude_model", settings.claude_model)
 
         for iteration in range(self._max_tool_iterations):
             try:
-                response: AnthropicMessage = await self._anthropic.messages.create(
-                    model=settings.claude_model,
+                response: AnthropicMessage = await anthropic_client.messages.create(
+                    model=claude_model,
                     max_tokens=1024,
                     system=system_prompt,
                     messages=messages,

@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: radial-gradient(1200px 600px at 50% -10%, #1a1f33 0%, #0a0b0f 60%);
+  color: #e8eaf0;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #262a3a;
+  border-radius: 999px;
+}
+
+.scroll-fade-top {
+  mask-image: linear-gradient(to bottom, transparent 0, black 24px);
+}

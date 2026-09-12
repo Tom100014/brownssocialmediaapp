@@ -21,6 +21,7 @@ from typing import Any, Literal, Optional
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
@@ -38,6 +39,15 @@ from tools_manager import ToolExecutionError, registry as tool_registry
 logger = logging.getLogger("jarvis.server_api")
 
 app = FastAPI(title="Jarvis Assistant API", version="0.1.0")
+
+_cors_origins = [o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _brain_router = BrainRouter(
     tool_schemas=tool_registry.schemas,

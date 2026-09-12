@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     api_auth_token: SecretStr = Field(
         ..., description="Shared Secret zur Absicherung von /chat, /webhook, /context"
     )
+    cors_allowed_origins: str = Field(
+        default="*",
+        description=(
+            "Kommagetrennte Liste erlaubter Origins für das Web-Frontend (z. B. "
+            "'https://jarvis-frontend.vercel.app,http://localhost:3000'). '*' erlaubt alle."
+        ),
+    )
 
     # --- Lokaler Client (Laptop-Daemon) -----------------------------------
     local_client_poll_interval_seconds: float = Field(default=3.0, ge=1.0, le=30.0)

@@ -128,6 +128,46 @@ class ContextLoader:
         )
 
 
+class MemoryLoader:
+    """Liest das Langzeit-Gedächtnis (tools_manager.remember_fact) und spielt
+    die zuletzt aktualisierten Fakten automatisch in jedes System-Prompt ein -
+    das ist Jarvis' "Dazulernen": einmal Gemerktes ist ab dann in jedem
+    Gespräch präsent, ohne dass der Nutzer es wiederholen muss."""
+
+    def __init__(self, limit: int = 30) -> None:
+        self._limit = limit
+
+    def as_system_prompt_fragment(self) -> str:
+        from storage import get_connection  # lokaler Import: vermeidet Zyklus bei Modul-Init
+
+        try:
+            conn = get_connection()
+            rows = conn.execute(
+                "SELECT key, value, category FROM memory ORDER BY updated_at DESC LIMIT ?",
+                (self._limit,),
+            ).fetchall()
+        except Exception:
+            logger.exception("Langzeit-Gedächtnis konnte nicht geladen werden.")
+            return ""
+
+        if not rows:
+            return ""
+
+        lines = [f"- {row['key']} ({row['category'] or 'allgemein'}): {row['value']}" for row in rows]
+        return "\n\n# Gemerktes Wissen über den Master (Langzeit-Gedächtnis)\n" + "\n".join(lines)
+
+
+PERSONA_PROMPT = (
+    "Du bist Jarvis - ein souveräner, hochkompetenter operativer Assistent auf Weltklasse-Niveau. "
+    "Du sprichst deinen Nutzer respektvoll als 'Master' an. Dein Ton ist ruhig, präzise, "
+    "selbstbewusst und niemals unterwürfig oder ausschweifend - wie ein erstklassiger Chief of "
+    "Staff, der auf den Punkt kommt und mitdenkt. Behaupte niemals einen Systemzustand - prüfe "
+    "ihn immer über die bereitgestellten Tools. Wenn dir der Master etwas mitteilt, das er sich "
+    "gemerkt haben möchte, nutze das 'remember_fact'-Tool, damit du in Zukunft von selbst darauf "
+    "zurückgreifst."
+)
+
+
 def classify_complexity(user_input: str, tools_available: bool) -> ModelTarget:
     """Heuristisches Routing ohne LLM-Aufruf (kostet keine Latenz).
 
@@ -169,6 +209,7 @@ class BrainRouter:
         max_tool_iterations: int = 6,
     ) -> None:
         self._context_loader = ContextLoader()
+        self._memory_loader = MemoryLoader()
         self._tool_schemas = tool_schemas or []
         self._tool_executor = tool_executor
         self._max_tool_iterations = max_tool_iterations
@@ -247,8 +288,12 @@ class BrainRouter:
     # -- Gemini Flash -----------------------------------------------------
 
     async def _call_flash(self, user_input: str) -> BrainResponse:
-        system_fragment = self._context_loader.as_system_prompt_fragment()
-        prompt = f"{system_fragment}\n\nNutzeranfrage: {user_input}".strip()
+        system_fragment = (
+            PERSONA_PROMPT
+            + self._context_loader.as_system_prompt_fragment()
+            + self._memory_loader.as_system_prompt_fragment()
+        )
+        prompt = f"{system_fragment}\n\nAnfrage des Master: {user_input}".strip()
         gemini_model = self._resolve_gemini_model()
 
         try:
@@ -273,10 +318,9 @@ class BrainRouter:
         self, user_input: str, conversation_history: list[dict[str, Any]]
     ) -> BrainResponse:
         system_prompt = (
-            "Du bist Jarvis, ein präziser operativer Assistent. "
-            "Behaupte niemals einen Systemzustand - prüfe ihn immer über die "
-            "bereitgestellten Tools, falls verfügbar."
+            PERSONA_PROMPT
             + self._context_loader.as_system_prompt_fragment()
+            + self._memory_loader.as_system_prompt_fragment()
         )
 
         messages: list[dict[str, Any]] = [*conversation_history, {"role": "user", "content": user_input}]

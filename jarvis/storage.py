@@ -142,6 +142,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS memory (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key         TEXT NOT NULL UNIQUE,
+            value       TEXT NOT NULL,
+            category    TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
         """
     )
     conn.commit()

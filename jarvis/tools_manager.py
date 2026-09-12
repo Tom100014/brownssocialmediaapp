@@ -1,5 +1,6 @@
 """
-tools_manager.py - Die 12 deterministischen Standard-Werkzeuge von Jarvis.
+tools_manager.py - Die deterministischen Standard-Werkzeuge von Jarvis
+(12 Kern-Tools + Langzeit-Gedächtnis).
 
 Grundsatz: Zustände werden NIE vom LLM geraten. Jedes Tool führt eine echte
 Abfrage aus (SQLite, Dateisystem, Subprocess, externe API) und gibt
@@ -490,7 +491,76 @@ async def weather_current(city: str) -> dict[str, Any]:
 
 
 # =========================================================================
-# 12. System-Check (echte Subprocess-Abfrage - KEINE Halluzination)
+# 13-14. Langzeit-Gedächtnis ("dazulernen")
+#
+# Fakten, die der Nutzer explizit mitteilt (Präferenzen, wiederkehrende
+# Infos, Korrekturen), werden hier persistent abgelegt und bei jedem
+# System-Prompt automatisch mit eingespielt (siehe brain_router.MemoryStore).
+# Auch das ist deterministisch: Jarvis "errät" gespeichertes Wissen nie,
+# er liest es aus SQLite.
+# =========================================================================
+
+
+@tool(
+    {
+        "name": "remember_fact",
+        "description": (
+            "Speichert eine Tatsache/Präferenz dauerhaft im Langzeit-Gedächtnis, damit sie in "
+            "künftigen Gesprächen automatisch bekannt ist. Nutzen, wenn der Nutzer explizit "
+            "etwas mitteilt, das man sich merken soll (z. B. Vorlieben, wiederkehrende Fakten)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Kurzer, eindeutiger Schlüssel, z. B. 'lieblingskaffee'"},
+                "value": {"type": "string", "description": "Der zu merkende Inhalt"},
+                "category": {"type": "string", "description": "z. B. 'präferenz', 'kontext', 'projekt'"},
+            },
+            "required": ["key", "value"],
+        },
+    }
+)
+async def remember_fact(key: str, value: str, category: Optional[str] = None) -> dict[str, Any]:
+    now = _now_iso()
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO memory (key, value, category, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, category=excluded.category, updated_at=excluded.updated_at
+        """,
+        (key, value, category, now, now),
+    )
+    conn.commit()
+    return {"key": key, "status": "remembered"}
+
+
+@tool(
+    {
+        "name": "recall_facts",
+        "description": "Durchsucht das Langzeit-Gedächtnis nach gespeicherten Fakten.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Suchbegriff, optional - leer lässt alles zurückgeben"},
+            },
+        },
+    }
+)
+async def recall_facts(query: Optional[str] = None) -> dict[str, Any]:
+    conn = get_connection()
+    if query:
+        rows = conn.execute(
+            "SELECT * FROM memory WHERE key LIKE ? OR value LIKE ? ORDER BY updated_at DESC",
+            (f"%{query}%", f"%{query}%"),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM memory ORDER BY updated_at DESC LIMIT 50").fetchall()
+    return {"facts": [dict(row) for row in rows]}
+
+
+# =========================================================================
+# 15. System-Check (echte Subprocess-Abfrage - KEINE Halluzination)
 # =========================================================================
 
 _SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.@-]+$")

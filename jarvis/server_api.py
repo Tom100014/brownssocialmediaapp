@@ -20,10 +20,11 @@ from typing import Any, Literal, Optional
 
 from pathlib import Path
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
+from audio_pipeline import AudioPipeline, AudioPipelineError
 from brain_router import BrainRouter, BrainRouterError
 from config import CONTEXT_DIR, settings
 from connectors_manager import (
@@ -42,6 +43,7 @@ _brain_router = BrainRouter(
     tool_schemas=tool_registry.schemas,
     tool_executor=tool_registry.execute,
 )
+_audio_pipeline = AudioPipeline()
 
 # In-memory Konversationsverlauf je Session. Geht bei Server-Neustart verloren -
 # unkritisch, da jede Anfrage ohnehin den frischen Kontext aus /context lädt.
@@ -316,6 +318,41 @@ async def list_tools() -> list[dict[str, Any]]:
     """Zeigt alle registrierten Tool-Schemas (Anthropic-Format) - nützlich zum
     Debuggen und für eine spätere Admin-Übersicht."""
     return tool_registry.schemas
+
+
+# --- Voice-Endpunkte (dateibasiert, für Browser-/Frontend-Clients) ------
+#
+# Ergänzend zu audio_pipeline.AudioPipeline's Streaming-Methoden (gedacht für
+# einen direkten Mikrofon-/Lautsprecher-Client) bieten diese beiden
+# REST-Endpunkte einen einfachen Weg für ein Web-Frontend: eine im Browser
+# aufgenommene Sprachnachricht hochladen -> Text zurückbekommen, bzw. Text
+# schicken -> fertige MP3-Antwort zum Abspielen zurückbekommen.
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+
+
+@app.post("/voice/speak", dependencies=[Depends(require_auth)])
+async def voice_speak(request: SpeakRequest) -> Response:
+    try:
+        audio_bytes = await _audio_pipeline.synthesize_full(request.text, voice_id=request.voice_id)
+    except AudioPipelineError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
+@app.post("/voice/transcribe", dependencies=[Depends(require_auth)])
+async def voice_transcribe(audio: UploadFile = File(...)) -> dict[str, str]:
+    audio_bytes = await audio.read()
+    try:
+        text = await _audio_pipeline.transcribe_file(
+            audio_bytes, mime_type=audio.content_type or "audio/webm"
+        )
+    except (AudioPipelineError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return {"text": text}
 
 
 _ADMIN_HTML_PATH = Path(__file__).resolve().parent / "static" / "admin.html"

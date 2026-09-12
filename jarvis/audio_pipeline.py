@@ -186,3 +186,50 @@ class AudioPipeline:
                             yield audio_chunk
             except httpx.HTTPError as exc:
                 raise AudioPipelineError(f"ElevenLabs nicht erreichbar: {exc}") from exc
+
+    async def synthesize_full(self, text: str, *, voice_id: Optional[str] = None) -> bytes:
+        """Bequemlichkeitsmethode für Clients, die keine Chunk-für-Chunk-Wiedergabe
+        unterstützen (z. B. ein simples <audio>-Tag im Browser): sammelt den
+        gesamten Stream in einem MP3-Byte-Objekt."""
+        chunks = [chunk async for chunk in self.synthesize_stream(text, voice_id=voice_id)]
+        return b"".join(chunks)
+
+    async def transcribe_file(self, audio_bytes: bytes, *, mime_type: str = "audio/webm") -> str:
+        """Transkribiert eine vollständige Audiodatei (z. B. eine im Browser
+        aufgenommene Sprachnachricht) über Deepgrams Prerecorded-REST-API -
+        einfacher und robuster für Datei-Uploads als der Live-Websocket-Pfad
+        in `transcribe_stream`, der für kontinuierliches Mikrofon-Streaming
+        gedacht ist."""
+        if not audio_bytes:
+            raise ValueError("audio_bytes darf nicht leer sein.")
+
+        api_key = _resolve_deepgram_key()
+        model = connectors_manager.get_setting("deepgram_model", settings.deepgram_model)
+        language = connectors_manager.get_setting("deepgram_language", settings.deepgram_language)
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(
+                    "https://api.deepgram.com/v1/listen",
+                    params={"model": model, "language": language, "smart_format": "true"},
+                    headers={"Authorization": f"Token {api_key}", "Content-Type": mime_type},
+                    content=audio_bytes,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise AudioPipelineError(
+                    f"Deepgram-Fehler ({exc.response.status_code}): {exc.response.text}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise AudioPipelineError(f"Deepgram nicht erreichbar: {exc}") from exc
+
+        data = response.json()
+        try:
+            transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
+        except (KeyError, IndexError) as exc:
+            raise AudioPipelineError("Deepgram-Antwort enthielt kein Transkript.") from exc
+
+        if not transcript.strip():
+            raise AudioPipelineError("Deepgram lieferte keinen erkennbaren Text.")
+
+        return autocorrect_transcript(transcript.strip())

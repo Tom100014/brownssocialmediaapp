@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jarvis - Connector-Verwaltung</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e2230;
+    --border: #2a2f3d;
+    --text: #e8eaf0;
+    --muted: #9aa1b2;
+    --accent: #5b8cff;
+    --ok: #35c186;
+    --err: #ff5d6c;
+    --warn: #f3b95f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+
+  .top-bar {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 12px; border-radius: 10px; margin-bottom: 24px;
+  }
+  .top-bar input {
+    flex: 1; min-width: 200px;
+  }
+  input, select {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 6px; font-size: 13px; width: 100%;
+  }
+  button {
+    cursor: pointer; border: none; border-radius: 6px; padding: 8px 14px;
+    font-size: 13px; font-weight: 600;
+  }
+  button.primary { background: var(--accent); color: white; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px; margin-bottom: 28px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: center; }
+  .card-head h3 { margin: 0; font-size: 15px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .badge.connected { color: var(--ok); border-color: var(--ok); }
+  .badge.disabled { color: var(--warn); border-color: var(--warn); }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  .status-line { font-size: 12px; min-height: 16px; }
+  .status-line.ok { color: var(--ok); }
+  .status-line.err { color: var(--err); }
+  section.settings {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  }
+  section.settings .row { align-items: flex-end; }
+  section.settings .field { flex: 1; min-width: 180px; }
+</style>
+</head>
+<body>
+  <h1>Jarvis - Connector-Verwaltung</h1>
+  <p class="sub">Alle externen Anbindungen (LLM, Voice, Kalender, Wetter, ...) an einer Stelle verbinden, testen und verwalten.</p>
+
+  <div class="top-bar">
+    <input id="serverUrl" placeholder="Server-URL, z.B. http://localhost:8420" />
+    <input id="apiToken" type="password" placeholder="API_AUTH_TOKEN" />
+    <button class="primary" onclick="saveConnectionAndReload()">Verbinden mit Server</button>
+    <span id="topStatus" class="status-line"></span>
+  </div>
+
+  <div id="cards" class="grid"><p class="sub">Bitte zuerst Server-URL und Token eingeben.</p></div>
+
+  <section class="settings">
+    <h3 style="margin-top:0">Allgemeine Einstellungen</h3>
+    <div class="row">
+      <div class="field">
+        <label>Routing-Modus</label>
+        <select id="routingMode">
+          <option value="heuristic">heuristic (empfohlen)</option>
+          <option value="always_flash">always_flash</option>
+          <option value="always_sonnet">always_sonnet</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Claude-Modell</label>
+        <input id="claudeModel" placeholder="claude-3-5-sonnet-20241022" />
+      </div>
+      <div class="field">
+        <label>Gemini-Modell</label>
+        <input id="geminiModel" placeholder="gemini-2.5-flash" />
+      </div>
+      <button class="primary" onclick="saveSettings()">Speichern</button>
+    </div>
+    <div id="settingsStatus" class="status-line"></div>
+  </section>
+
+<script>
+const state = { schemas: [], connectors: {} };
+
+function apiBase() { return (localStorage.getItem('jarvis_server_url') || '').replace(/\/$/, ''); }
+function apiToken() { return localStorage.getItem('jarvis_api_token') || ''; }
+
+async function api(path, options = {}) {
+  const res = await fetch(apiBase() + path, {
+    ...options,
+    headers: {
+      'Authorization': 'Bearer ' + apiToken(),
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const isJson = res.headers.get('content-type')?.includes('application/json');
+  const body = isJson ? await res.json() : await res.text();
+  if (!res.ok) throw new Error(typeof body === 'string' ? body : (body.detail || JSON.stringify(body)));
+  return body;
+}
+
+function saveConnectionAndReload() {
+  localStorage.setItem('jarvis_server_url', document.getElementById('serverUrl').value.trim());
+  localStorage.setItem('jarvis_api_token', document.getElementById('apiToken').value.trim());
+  loadAll();
+}
+
+async function loadAll() {
+  const topStatus = document.getElementById('topStatus');
+  if (!apiBase() || !apiToken()) { topStatus.textContent = ''; return; }
+  topStatus.textContent = 'Lade...';
+  topStatus.className = 'status-line';
+  try {
+    const [schemas, connectors, settings] = await Promise.all([
+      api('/connectors/schemas'),
+      api('/connectors'),
+      api('/settings'),
+    ]);
+    state.schemas = schemas;
+    state.connectors = Object.fromEntries(connectors.map(c => [c.name, c]));
+    renderCards();
+    document.getElementById('routingMode').value = settings.routing_mode || 'heuristic';
+    document.getElementById('claudeModel').value = settings.claude_model || '';
+    document.getElementById('geminiModel').value = settings.gemini_model || '';
+    topStatus.textContent = 'Verbunden.';
+    topStatus.className = 'status-line ok';
+  } catch (err) {
+    topStatus.textContent = 'Fehler: ' + err.message;
+    topStatus.className = 'status-line err';
+  }
+}
+
+function renderCards() {
+  const container = document.getElementById('cards');
+  container.innerHTML = '';
+  for (const schema of state.schemas) {
+    const existing = state.connectors[schema.connector_type];
+    container.appendChild(buildCard(schema, existing));
+  }
+}
+
+function buildCard(schema, existing) {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  const title = document.createElement('h3');
+  title.textContent = schema.label;
+  const badge = document.createElement('span');
+  if (existing) {
+    badge.textContent = existing.enabled ? 'Verbunden' : 'Deaktiviert';
+    badge.className = 'badge ' + (existing.enabled ? 'connected' : 'disabled');
+  } else {
+    badge.textContent = 'Nicht verbunden';
+    badge.className = 'badge';
+  }
+  head.appendChild(title);
+  head.appendChild(badge);
+  card.appendChild(head);
+
+  const fieldEls = {};
+  for (const field of schema.fields) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const label = document.createElement('label');
+    label.textContent = field.description || field.key;
+    const input = document.createElement('input');
+    input.type = field.secret ? 'password' : 'text';
+    const currentValue = existing?.credentials?.[field.key];
+    input.placeholder = field.secret && currentValue ? currentValue : (field.required ? 'erforderlich' : 'optional');
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    card.appendChild(wrap);
+    fieldEls[field.key] = input;
+  }
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'status-line';
+
+  const row = document.createElement('div');
+  row.className = 'row';
+
+  const connectBtn = document.createElement('button');
+  connectBtn.className = 'primary';
+  connectBtn.textContent = existing ? 'Aktualisieren' : 'Verbinden';
+  connectBtn.onclick = async () => {
+    const credentials = {};
+    for (const [key, input] of Object.entries(fieldEls)) {
+      if (input.value.trim()) credentials[key] = input.value.trim();
+      else if (existing?.credentials?.[key] && input.type === 'password') {
+        // Feld leer gelassen -> vorhandenen (redigierten) Wert nicht überschreiben
+      }
+    }
+    statusLine.textContent = 'Speichere...';
+    statusLine.className = 'status-line';
+    try {
+      await api('/connectors/' + schema.connector_type, {
+        method: 'PUT',
+        body: JSON.stringify({ connector_type: schema.connector_type, credentials, config: {}, enabled: true }),
+      });
+      statusLine.textContent = 'Gespeichert.';
+      statusLine.className = 'status-line ok';
+      loadAll();
+    } catch (err) {
+      statusLine.textContent = 'Fehler: ' + err.message;
+      statusLine.className = 'status-line err';
+    }
+  };
+  row.appendChild(connectBtn);
+
+  if (existing) {
+    const testBtn = document.createElement('button');
+    testBtn.className = 'ghost';
+    testBtn.textContent = 'Testen';
+    testBtn.onclick = async () => {
+      statusLine.textContent = 'Teste...';
+      statusLine.className = 'status-line';
+      try {
+        const result = await api('/connectors/' + schema.connector_type + '/test', { method: 'POST' });
+        if (result.status === 'ok') {
+          statusLine.textContent = 'Verbindung erfolgreich.';
+          statusLine.className = 'status-line ok';
+        } else if (result.status === 'not_implemented') {
+          statusLine.textContent = 'Kein Live-Test für diesen Typ verfügbar.';
+          statusLine.className = 'status-line';
+        } else {
+          statusLine.textContent = 'Fehler: ' + (result.detail || 'unbekannt');
+          statusLine.className = 'status-line err';
+        }
+      } catch (err) {
+        statusLine.textContent = 'Fehler: ' + err.message;
+        statusLine.className = 'status-line err';
+      }
+    };
+    row.appendChild(testBtn);
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'ghost';
+    toggleBtn.textContent = existing.enabled ? 'Deaktivieren' : 'Aktivieren';
+    toggleBtn.onclick = async () => {
+      await api('/connectors/' + schema.connector_type + '/enable', {
+        method: 'POST',
+        body: JSON.stringify({ enabled: !existing.enabled }),
+      });
+      loadAll();
+    };
+    row.appendChild(toggleBtn);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'danger';
+    deleteBtn.textContent = 'Trennen';
+    deleteBtn.onclick = async () => {
+      if (!confirm(`Connector '${schema.label}' wirklich trennen?`)) return;
+      await api('/connectors/' + schema.connector_type, { method: 'DELETE' });
+      loadAll();
+    };
+    row.appendChild(deleteBtn);
+  }
+
+  card.appendChild(row);
+  card.appendChild(statusLine);
+  return card;
+}
+
+async function saveSettings() {
+  const statusLine = document.getElementById('settingsStatus');
+  statusLine.textContent = 'Speichere...';
+  statusLine.className = 'status-line';
+  try {
+    await api('/settings', {
+      method: 'PUT',
+      body: JSON.stringify({
+        routing_mode: document.getElementById('routingMode').value,
+        claude_model: document.getElementById('claudeModel').value.trim(),
+        gemini_model: document.getElementById('geminiModel').value.trim(),
+      }),
+    });
+    statusLine.textContent = 'Gespeichert.';
+    statusLine.className = 'status-line ok';
+  } catch (err) {
+    statusLine.textContent = 'Fehler: ' + err.message;
+    statusLine.className = 'status-line err';
+  }
+}
+
+// Initial: gespeicherte Verbindungsdaten vorbelegen
+document.getElementById('serverUrl').value = apiBase();
+document.getElementById('apiToken').value = apiToken();
+if (apiBase() && apiToken()) loadAll();
+</script>
+</body>
+</html>

@@ -103,6 +103,45 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             value_json  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            done        INTEGER NOT NULL DEFAULT 0,
+            due_date    TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            start_time  TEXT NOT NULL,
+            end_time    TEXT,
+            location    TEXT,
+            notes       TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS leads (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL,
+            source        TEXT,
+            contact_info  TEXT,
+            notes         TEXT,
+            created_at    TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            email       TEXT,
+            phone       TEXT,
+            notes       TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
         """
     )
     conn.commit()

@@ -1,39 +1,52 @@
 """
 server_api.py - FastAPI-Backend für den zentralen Jarvis-Server.
 
-STATUS: Gerüst (Schritt 2 der Implementierung). Definiert die geplanten
-Endpunkte und die Befehls-Queue für den lokalen Client. Volle Anbindung an
-brain_router.py / tools_manager.py / audio_pipeline.py folgt im nächsten
-Schritt.
-
-Endpunkte (geplant):
-    POST /chat      - Text/Voice-Eingabe, liefert Jarvis-Antwort
+Endpunkte:
+    POST /chat      - Text/Voice-Eingabe, liefert Jarvis-Antwort (brain_router + tools_manager)
     POST /webhook   - externe Trigger (z. B. Cron, IFTTT, Kalender-Push)
     POST /context   - Cron-Aktualisierung der gepufferten Kontextdatei
     GET  /commands  - Polling-Endpunkt für local_client.py
     POST /commands/{id}/ack - Bestätigung einer ausgeführten Aktion
+    /connectors, /settings - Verwaltung aller externen Anbindungen & Laufzeit-Settings
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
+from pathlib import Path
+
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from config import settings
+from brain_router import BrainRouter, BrainRouterError
+from config import CONTEXT_DIR, settings
 from connectors_manager import (
     ConnectorNotFoundError,
     ConnectorValidationError,
     connectors_manager,
     list_schemas,
 )
+from tools_manager import ToolExecutionError, registry as tool_registry
 
 logger = logging.getLogger("jarvis.server_api")
 
 app = FastAPI(title="Jarvis Assistant API", version="0.1.0")
+
+_brain_router = BrainRouter(
+    tool_schemas=tool_registry.schemas,
+    tool_executor=tool_registry.execute,
+)
+
+# In-memory Konversationsverlauf je Session. Geht bei Server-Neustart verloren -
+# unkritisch, da jede Anfrage ohnehin den frischen Kontext aus /context lädt.
+_conversation_history: dict[str, list[dict[str, Any]]] = {}
+_MAX_HISTORY_TURNS = 20
 
 
 def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
@@ -70,28 +83,72 @@ _command_queue: dict[str, PendingCommand] = {}
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_auth)])
 async def chat(request: ChatRequest) -> ChatResponse:
-    """TODO (nächster Schritt): Anbindung an brain_router.BrainRouter.route()."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Chat-Endpunkt wird im nächsten Implementierungsschritt an brain_router angebunden.",
-    )
+    session_id = request.session_id or str(uuid.uuid4())
+    history = _conversation_history.get(session_id, [])
+
+    try:
+        response = await _brain_router.route(request.message, conversation_history=history)
+    except BrainRouterError as exc:
+        logger.warning("Chat-Anfrage fehlgeschlagen: %s", exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    history.append({"role": "user", "content": request.message})
+    history.append({"role": "assistant", "content": response.text})
+    _conversation_history[session_id] = history[-_MAX_HISTORY_TURNS * 2 :]
+
+    return ChatResponse(reply=response.text, model_used=response.model_used.value, session_id=session_id)
 
 
 @app.post("/context", dependencies=[Depends(require_auth)])
 async def update_context(request: ContextUpdateRequest) -> dict[str, str]:
-    """TODO (nächster Schritt): Schreibt request.payload nach context/live_context.json."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Context-Update folgt im nächsten Implementierungsschritt.",
-    )
+    """Schreibt den (typischerweise per Cron zusammengestellten) Kontext-Payload
+    nach context/live_context.json, den brain_router.ContextLoader vor jedem
+    LLM-Aufruf einliest."""
+    payload = dict(request.payload)
+    payload["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+    context_path = CONTEXT_DIR / "live_context.json"
+    try:
+        context_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Kontext konnte nicht geschrieben werden: {exc}"
+        ) from exc
+
+    return {"status": "updated", "last_updated": payload["last_updated"]}
+
+
+class WebhookPayload(BaseModel):
+    """Zwei unterstützte Formen:
+    1. {"tool": "weather_current", "arguments": {...}} - führt ein Tool direkt aus.
+    2. {"action_id": "close_browser_tabs", "parameters": {...}} - reiht einen
+       Trigger für local_client.py in die Befehls-Queue ein.
+    """
+
+    tool: Optional[str] = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    action_id: Optional[str] = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 @app.post("/webhook", dependencies=[Depends(require_auth)])
-async def webhook(payload: dict[str, Any]) -> dict[str, str]:
-    """TODO (nächster Schritt): Externe Trigger auf Tools/Router mappen."""
+async def webhook(payload: WebhookPayload) -> dict[str, Any]:
+    if payload.tool:
+        try:
+            result = await tool_registry.execute(payload.tool, payload.arguments)
+        except ToolExecutionError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {"status": "executed", "tool": payload.tool, "result": result}
+
+    if payload.action_id:
+        command_uuid = enqueue_command(payload.action_id, payload.parameters)
+        return {"status": "queued", "command_id": command_uuid}
+
     raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Webhook-Verarbeitung folgt im nächsten Implementierungsschritt.",
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Webhook-Payload benötigt entweder 'tool' oder 'action_id'.",
     )
 
 
@@ -252,6 +309,26 @@ async def get_settings_endpoint() -> dict[str, Any]:
 @app.put("/settings", dependencies=[Depends(require_auth)])
 async def update_settings_endpoint(values: dict[str, Any]) -> dict[str, Any]:
     return connectors_manager.update_settings(values)
+
+
+@app.get("/tools", dependencies=[Depends(require_auth)])
+async def list_tools() -> list[dict[str, Any]]:
+    """Zeigt alle registrierten Tool-Schemas (Anthropic-Format) - nützlich zum
+    Debuggen und für eine spätere Admin-Übersicht."""
+    return tool_registry.schemas
+
+
+_ADMIN_HTML_PATH = Path(__file__).resolve().parent / "static" / "admin.html"
+
+
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+async def admin_ui() -> str:
+    """Statische Connector-Verwaltungsoberfläche: pro Connector Felder,
+    'Verbinden'/'Aktualisieren', 'Testen', 'Aktivieren/Deaktivieren' und
+    'Trennen'. Die Seite selbst ist ungeschützt (reines HTML/JS), jeder
+    API-Aufruf darin erfordert aber weiterhin das API_AUTH_TOKEN, das man im
+    Browser einträgt und das lokal (localStorage) gespeichert wird."""
+    return _ADMIN_HTML_PATH.read_text(encoding="utf-8")
 
 
 @app.get("/health")

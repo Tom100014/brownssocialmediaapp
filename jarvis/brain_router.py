@@ -1,0 +1,317 @@
+"""
+brain_router.py - Das zentrale "Gehirn" von Jarvis.
+
+Verantwortlichkeiten:
+    1. Kontext-Loader: liest eine schlanke, vorab gepufferte JSON-Kontextdatei
+       (Termine, Prio-Status, Nutzerprofil) und reicht sie als System-Kontext
+       an das jeweilige LLM weiter.
+    2. Hybrid-Routing: entscheidet je Anfrage, ob Gemini 2.5 Flash (schnell,
+       günstig, für Status/Routine) oder Claude 3.5 Sonnet (Tool-Calling,
+       komplexe Entscheidungen) angesprochen wird.
+    3. Einheitliche Antwort-Schnittstelle für server_api.py, unabhängig
+       davon, welcher Provider tatsächlich geantwortet hat.
+
+Tools werden NICHT von diesem Modul ausgeführt - brain_router.py ruft bei
+Tool-Use-Anfragen von Claude lediglich einen injizierten `tool_executor`
+(aus tools_manager.py) auf und speist dessen Resultat zurück in den
+Konversationsverlauf. So bleibt das Routing frei von Fachlogik.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+
+import anthropic
+import google.generativeai as genai
+from anthropic.types import Message as AnthropicMessage
+
+from config import CONTEXT_DIR, settings
+
+logger = logging.getLogger("jarvis.brain_router")
+
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
+
+# Schlüsselwörter, die auf komplexe Aufgaben / Tool-Bedarf hindeuten und
+# daher IMMER an Claude Sonnet geroutet werden, selbst im heuristischen Modus.
+SONNET_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "verschiebe", "lösche", "storniere", "erstelle", "trage ein", "buche",
+    "analysiere", "vergleiche", "entscheide", "plane", "kontakt",
+    "lead", "rechnung", "beleg", "foto", "bild", "screenshot",
+)
+
+
+class ModelTarget(str, Enum):
+    FLASH = "gemini-flash"
+    SONNET = "claude-sonnet"
+
+
+class BrainRouterError(Exception):
+    """Basisklasse für alle Fehler des Routers."""
+
+
+class ContextLoadError(BrainRouterError):
+    """Der Kontext konnte nicht geladen werden."""
+
+
+class ProviderError(BrainRouterError):
+    """Ein LLM-Provider hat einen Fehler zurückgegeben oder ist nicht erreichbar."""
+
+
+@dataclass
+class BrainResponse:
+    """Einheitliches Antwortformat, unabhängig vom tatsächlich genutzten Modell."""
+
+    text: str
+    model_used: ModelTarget
+    tool_calls_made: list[str] = field(default_factory=list)
+    latency_seconds: float = 0.0
+    raw: Any = None
+
+
+class ContextLoader:
+    """Lädt die gepufferte JSON-Kontextdatei und hält sie per mtime-Check aktuell.
+
+    Die Datei wird von server_api.py's `/context`-Endpunkt (Cron-getriggert)
+    aktualisiert. Dieses Modul liest sie nur - niemals schreibend.
+    """
+
+    def __init__(self, context_path: Optional[Path] = None) -> None:
+        self._path = context_path or (CONTEXT_DIR / "live_context.json")
+        self._cache: dict[str, Any] = {}
+        self._cached_mtime: float = -1.0
+
+    def load(self) -> dict[str, Any]:
+        if not self._path.exists():
+            logger.warning(
+                "Kontextdatei %s nicht gefunden - fahre mit leerem Kontext fort.",
+                self._path,
+            )
+            return {}
+
+        try:
+            mtime = self._path.stat().st_mtime
+            if mtime == self._cached_mtime:
+                return self._cache
+
+            with self._path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+
+            if not isinstance(data, dict):
+                raise ContextLoadError(
+                    f"Kontextdatei {self._path} muss ein JSON-Objekt enthalten."
+                )
+
+            self._cache = data
+            self._cached_mtime = mtime
+            return data
+        except json.JSONDecodeError as exc:
+            raise ContextLoadError(f"Ungültiges JSON in {self._path}: {exc}") from exc
+        except OSError as exc:
+            raise ContextLoadError(f"Kontextdatei {self._path} nicht lesbar: {exc}") from exc
+
+    def as_system_prompt_fragment(self) -> str:
+        """Rendert den Kontext kompakt für die Einbettung ins System-Prompt."""
+        context = self.load()
+        if not context:
+            return ""
+        return (
+            "\n\n# Aktueller Kontext (automatisch geladen)\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2)}\n"
+        )
+
+
+def classify_complexity(user_input: str, tools_available: bool) -> ModelTarget:
+    """Heuristisches Routing ohne LLM-Aufruf (kostet keine Latenz).
+
+    Grundsatz: im Zweifel Richtung Sonnet, da Fehlrouting nach Flash bei
+    tatsächlichem Tool-Bedarf eine zweite Roundtrip-Latenz erzeugt.
+    """
+    if settings.routing_mode == "always_flash":
+        return ModelTarget.FLASH
+    if settings.routing_mode == "always_sonnet":
+        return ModelTarget.SONNET
+
+    normalized = user_input.lower().strip()
+
+    if not normalized:
+        return ModelTarget.FLASH
+
+    if tools_available and any(kw in normalized for kw in SONNET_TRIGGER_KEYWORDS):
+        return ModelTarget.SONNET
+
+    # Kurze, reine Statusfragen ("Wie ist das Wetter?", "Was steht heute an?")
+    # ohne erkennbaren Handlungsbedarf -> Flash.
+    is_short = len(normalized.split()) <= 14
+    has_question_mark = "?" in normalized
+    if is_short and (has_question_mark or normalized.startswith(("status", "wie", "was", "wann", "wo"))):
+        if not any(kw in normalized for kw in SONNET_TRIGGER_KEYWORDS):
+            return ModelTarget.FLASH
+
+    return ModelTarget.SONNET
+
+
+class BrainRouter:
+    """Öffentliche Schnittstelle: `await router.route(...)`."""
+
+    def __init__(
+        self,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+        tool_executor: Optional[ToolExecutor] = None,
+        max_tool_iterations: int = 6,
+    ) -> None:
+        self._context_loader = ContextLoader()
+        self._tool_schemas = tool_schemas or []
+        self._tool_executor = tool_executor
+        self._max_tool_iterations = max_tool_iterations
+
+        self._anthropic = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key.get_secret_value()
+        )
+
+        genai.configure(api_key=settings.google_api_key.get_secret_value())
+        self._gemini = genai.GenerativeModel(settings.gemini_model)
+
+    async def route(
+        self,
+        user_input: str,
+        *,
+        force_target: Optional[ModelTarget] = None,
+        conversation_history: Optional[list[dict[str, Any]]] = None,
+    ) -> BrainResponse:
+        """Routet eine einzelne Nutzeranfrage an das passende Modell.
+
+        Fällt bei einem Fehler des Flash-Pfads automatisch auf Sonnet zurück,
+        damit eine kurzzeitige Gemini-Störung den Assistenten nicht stumm
+        schaltet.
+        """
+        if not user_input or not user_input.strip():
+            raise ValueError("user_input darf nicht leer sein.")
+
+        target = force_target or classify_complexity(
+            user_input, tools_available=bool(self._tool_schemas)
+        )
+        logger.info("Routing-Entscheidung: %s -> %s", user_input[:80], target.value)
+
+        started = time.monotonic()
+        try:
+            if target is ModelTarget.FLASH:
+                response = await self._call_flash(user_input)
+            else:
+                response = await self._call_sonnet(user_input, conversation_history or [])
+        except ProviderError:
+            if target is ModelTarget.FLASH:
+                logger.warning("Flash-Pfad fehlgeschlagen, Fallback auf Sonnet.")
+                response = await self._call_sonnet(user_input, conversation_history or [])
+            else:
+                raise
+
+        response.latency_seconds = time.monotonic() - started
+        return response
+
+    # -- Gemini Flash -----------------------------------------------------
+
+    async def _call_flash(self, user_input: str) -> BrainResponse:
+        system_fragment = self._context_loader.as_system_prompt_fragment()
+        prompt = f"{system_fragment}\n\nNutzeranfrage: {user_input}".strip()
+
+        try:
+            result = await asyncio.wait_for(
+                self._gemini.generate_content_async(prompt),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ProviderError("Gemini Flash Timeout nach 15s.") from exc
+        except Exception as exc:  # google.api_core.exceptions.*
+            raise ProviderError(f"Gemini Flash Fehler: {exc}") from exc
+
+        text = getattr(result, "text", None)
+        if not text:
+            raise ProviderError("Gemini Flash lieferte eine leere Antwort.")
+
+        return BrainResponse(text=text.strip(), model_used=ModelTarget.FLASH, raw=result)
+
+    # -- Claude Sonnet (mit Tool-Calling) -----------------------------------
+
+    async def _call_sonnet(
+        self, user_input: str, conversation_history: list[dict[str, Any]]
+    ) -> BrainResponse:
+        system_prompt = (
+            "Du bist Jarvis, ein präziser operativer Assistent. "
+            "Behaupte niemals einen Systemzustand - prüfe ihn immer über die "
+            "bereitgestellten Tools, falls verfügbar."
+            + self._context_loader.as_system_prompt_fragment()
+        )
+
+        messages: list[dict[str, Any]] = [*conversation_history, {"role": "user", "content": user_input}]
+        tool_calls_made: list[str] = []
+
+        for iteration in range(self._max_tool_iterations):
+            try:
+                response: AnthropicMessage = await self._anthropic.messages.create(
+                    model=settings.claude_model,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=self._tool_schemas or anthropic.NOT_GIVEN,
+                )
+            except anthropic.APIStatusError as exc:
+                raise ProviderError(f"Claude Sonnet API-Fehler ({exc.status_code}): {exc.message}") from exc
+            except anthropic.APIConnectionError as exc:
+                raise ProviderError(f"Claude Sonnet nicht erreichbar: {exc}") from exc
+
+            if response.stop_reason != "tool_use":
+                final_text = "".join(
+                    block.text for block in response.content if block.type == "text"
+                )
+                return BrainResponse(
+                    text=final_text.strip(),
+                    model_used=ModelTarget.SONNET,
+                    tool_calls_made=tool_calls_made,
+                    raw=response,
+                )
+
+            if self._tool_executor is None:
+                raise ProviderError(
+                    "Claude fordert Tool-Use an, aber es ist kein tool_executor konfiguriert."
+                )
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results: list[dict[str, Any]] = []
+
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                tool_calls_made.append(block.name)
+                try:
+                    result = await self._tool_executor(block.name, block.input)
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result, ensure_ascii=False, default=str),
+                        }
+                    )
+                except Exception as exc:
+                    logger.exception("Tool '%s' fehlgeschlagen", block.name)
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"Fehler bei Tool-Ausführung: {exc}",
+                            "is_error": True,
+                        }
+                    )
+
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            raise ProviderError(
+                f"Tool-Use-Schleife nach {self._max_tool_iterations} Iterationen abgebrochen "
+                "(mögliche Endlosschleife)."
+            )

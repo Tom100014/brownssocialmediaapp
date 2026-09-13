@@ -400,7 +400,7 @@ async def analyze_image(
     image_path: str,
     question: str = "Beschreibe das Bild und extrahiere relevante Daten (z. B. Beträge, Datum).",
 ) -> dict[str, Any]:
-    import anthropic
+    import openai
 
     from config import settings
 
@@ -417,32 +417,36 @@ async def analyze_image(
     if media_type is None:
         raise ToolExecutionError(f"Nicht unterstütztes Bildformat: {path.suffix}")
 
-    api_key = connectors_manager.get_credential("anthropic", "api_key") or (
-        settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else None
+    api_key = connectors_manager.get_credential("openrouter", "api_key") or (
+        settings.openrouter_api_key.get_secret_value() if settings.openrouter_api_key else None
     )
     if not api_key:
-        raise ToolExecutionError("Kein Anthropic-API-Key konfiguriert (Connector 'anthropic' fehlt).")
+        raise ToolExecutionError("Kein OpenRouter-API-Key konfiguriert (Connector 'openrouter' fehlt).")
 
+    model = connectors_manager.get_credential("openrouter", "sonnet_model") or connectors_manager.get_setting(
+        "claude_model", settings.claude_model
+    )
     image_b64 = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    response = await client.messages.create(
-        model=settings.claude_model,
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": image_b64},
-                    },
-                    {"type": "text", "text": question},
-                ],
-            }
-        ],
-    )
-    text = "".join(block.text for block in response.content if block.type == "text")
+    client = openai.AsyncOpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=512,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question},
+                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
+                    ],
+                }
+            ],
+        )
+    except openai.OpenAIError as exc:
+        raise ToolExecutionError(f"Bildanalyse über OpenRouter fehlgeschlagen: {exc}") from exc
+
+    text = response.choices[0].message.content or ""
     return {"analysis": text.strip()}
 
 

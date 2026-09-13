@@ -55,17 +55,25 @@ class ConnectorSchema:
 # Code zu brechen - unbekannte Typen werden als "custom" mit Freiform-Feldern
 # akzeptiert (siehe upsert_connector).
 CONNECTOR_SCHEMAS: dict[str, ConnectorSchema] = {
-    "anthropic": ConnectorSchema(
-        connector_type="anthropic",
-        label="Anthropic (Claude Sonnet)",
+    "openrouter": ConnectorSchema(
+        connector_type="openrouter",
+        label="OpenRouter (LLM-Gateway für Claude + Gemini)",
         category="llm",
-        fields=[ConnectorField("api_key", description="Claude API-Key")],
-    ),
-    "google_gemini": ConnectorSchema(
-        connector_type="google_gemini",
-        label="Google Gemini (Flash)",
-        category="llm",
-        fields=[ConnectorField("api_key", description="Gemini API-Key")],
+        fields=[
+            ConnectorField("api_key", description="OpenRouter API-Key"),
+            ConnectorField(
+                "sonnet_model",
+                required=False,
+                secret=False,
+                description="Modell-Slug für komplexe Aufgaben, z. B. anthropic/claude-3.5-sonnet",
+            ),
+            ConnectorField(
+                "flash_model",
+                required=False,
+                secret=False,
+                description="Modell-Slug für schnelle Antworten, z. B. google/gemini-2.5-flash",
+            ),
+        ],
     ),
     "deepgram": ConnectorSchema(
         connector_type="deepgram",

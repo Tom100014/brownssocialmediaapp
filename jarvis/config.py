@@ -34,21 +34,21 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- LLM-Provider -----------------------------------------------------
-    # Optional: Die eigentliche Quelle der Wahrheit für API-Keys ist ab jetzt
-    # der verschlüsselte Connector-Store (siehe connectors_manager.py), der
-    # zur Laufzeit über die API gepflegt werden kann. Diese Felder dienen nur
-    # noch als Fallback für den allerersten Start / lokale Entwicklung.
-    anthropic_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für Claude (Sonnet)")
-    google_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für Gemini (Flash)")
+    # --- LLM-Provider (OpenRouter) ------------------------------------------
+    # Jarvis spricht Claude und Gemini nicht mehr direkt an, sondern über
+    # OpenRouter (ein Gateway im OpenAI-kompatiblen Format) - ein Key deckt
+    # beide Rollen ab. Optional: Die eigentliche Quelle der Wahrheit ist der
+    # verschlüsselte Connector-Store (siehe connectors_manager.py); dieses
+    # Feld dient nur als Fallback für den allerersten Start.
+    openrouter_api_key: SecretStr | None = Field(default=None, description="Fallback-API-Key für OpenRouter")
 
     claude_model: str = Field(
-        default="claude-3-5-sonnet-20241022",
-        description="Modell-ID für komplexe Analysen / Tool-Calling",
+        default="anthropic/claude-3.5-sonnet",
+        description="OpenRouter-Modell-Slug für komplexe Analysen / Tool-Calling",
     )
     gemini_model: str = Field(
-        default="gemini-2.5-flash",
-        description="Modell-ID für schnelle Routine-Antworten",
+        default="google/gemini-2.5-flash",
+        description="OpenRouter-Modell-Slug für schnelle Routine-Antworten",
     )
 
     # --- Sprachein-/ausgabe ----------------------------------------------

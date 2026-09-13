@@ -282,27 +282,19 @@ async def test_connector(name: str) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Connector '{name}' nicht gefunden.")
 
-    if record.connector_type == "anthropic":
-        import anthropic
+    if record.connector_type == "openrouter":
+        import openai
 
         try:
-            client = anthropic.AsyncAnthropic(api_key=record.credentials.get("api_key", ""))
-            await client.messages.create(
-                model=settings.claude_model,
+            client = openai.AsyncOpenAI(
+                api_key=record.credentials.get("api_key", ""), base_url="https://openrouter.ai/api/v1"
+            )
+            model = record.credentials.get("flash_model") or settings.gemini_model
+            await client.chat.completions.create(
+                model=model,
                 max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
             )
-            return {"status": "ok"}
-        except Exception as exc:
-            return {"status": "error", "detail": str(exc)}
-
-    if record.connector_type == "google_gemini":
-        import google.generativeai as genai
-
-        try:
-            genai.configure(api_key=record.credentials.get("api_key", ""))
-            model = genai.GenerativeModel(settings.gemini_model)
-            await model.generate_content_async("ping")
             return {"status": "ok"}
         except Exception as exc:
             return {"status": "error", "detail": str(exc)}

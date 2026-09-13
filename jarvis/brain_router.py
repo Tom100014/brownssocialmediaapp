@@ -5,21 +5,25 @@ Verantwortlichkeiten:
     1. Kontext-Loader: liest eine schlanke, vorab gepufferte JSON-Kontextdatei
        (Termine, Prio-Status, Nutzerprofil) und reicht sie als System-Kontext
        an das jeweilige LLM weiter.
-    2. Hybrid-Routing: entscheidet je Anfrage, ob Gemini 2.5 Flash (schnell,
-       günstig, für Status/Routine) oder Claude 3.5 Sonnet (Tool-Calling,
-       komplexe Entscheidungen) angesprochen wird.
+    2. Hybrid-Routing: entscheidet je Anfrage, ob ein schnelles Modell
+       (Standard: Gemini 2.5 Flash, für Status/Routine) oder ein starkes
+       Modell mit Tool-Calling (Standard: Claude 3.5 Sonnet, für komplexe
+       Entscheidungen) angesprochen wird.
     3. Einheitliche Antwort-Schnittstelle für server_api.py, unabhängig
-       davon, welcher Provider tatsächlich geantwortet hat.
+       davon, welches Modell tatsächlich geantwortet hat.
+
+Beide Modelle werden über OpenRouter (https://openrouter.ai) angesprochen -
+ein einziger API-Key deckt beliebige Modell-Anbieter im OpenAI-kompatiblen
+Format ab, statt separate Anthropic-/Google-SDKs und -Keys zu pflegen.
 
 Tools werden NICHT von diesem Modul ausgeführt - brain_router.py ruft bei
-Tool-Use-Anfragen von Claude lediglich einen injizierten `tool_executor`
-(aus tools_manager.py) auf und speist dessen Resultat zurück in den
-Konversationsverlauf. So bleibt das Routing frei von Fachlogik.
+Tool-Calls lediglich einen injizierten `tool_executor` (aus tools_manager.py)
+auf und speist dessen Resultat zurück in den Konversationsverlauf. So bleibt
+das Routing frei von Fachlogik.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -28,12 +32,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-import anthropic
-import google.generativeai as genai
-from anthropic.types import Message as AnthropicMessage
+import openai
 
 from config import CONTEXT_DIR, settings
 from connectors_manager import connectors_manager
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 logger = logging.getLogger("jarvis.brain_router")
 
@@ -214,39 +218,60 @@ class BrainRouter:
         self._tool_executor = tool_executor
         self._max_tool_iterations = max_tool_iterations
 
-        # Clients werden lazy (und bei jeder Anfrage neu aufgelöst) gebaut, da
-        # Keys sich über den Connector-Store (server_api.py: /connectors)
-        # jederzeit ändern können, ohne dass der Server neu gestartet werden muss.
-        self._anthropic_client_cache: tuple[str, anthropic.AsyncAnthropic] | None = None
+        # Der Client wird lazy (und bei jeder Anfrage neu aufgelöst) gebaut, da
+        # der Key sich über den Connector-Store (server_api.py: /connectors)
+        # jederzeit ändern kann, ohne dass der Server neu gestartet werden muss.
+        self._openrouter_client_cache: tuple[str, openai.AsyncOpenAI] | None = None
 
-    def _resolve_anthropic_client(self) -> anthropic.AsyncAnthropic:
-        api_key = connectors_manager.get_credential("anthropic", "api_key") or (
-            settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else None
+    def _resolve_openrouter_client(self) -> openai.AsyncOpenAI:
+        api_key = connectors_manager.get_credential("openrouter", "api_key") or (
+            settings.openrouter_api_key.get_secret_value() if settings.openrouter_api_key else None
         )
         if not api_key:
             raise ProviderError(
-                "Kein Anthropic-API-Key konfiguriert. Bitte Connector 'anthropic' über "
+                "Kein OpenRouter-API-Key konfiguriert. Bitte Connector 'openrouter' über "
                 "POST /connectors anlegen."
             )
-        if self._anthropic_client_cache is not None and self._anthropic_client_cache[0] == api_key:
-            return self._anthropic_client_cache[1]
+        if self._openrouter_client_cache is not None and self._openrouter_client_cache[0] == api_key:
+            return self._openrouter_client_cache[1]
 
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        self._anthropic_client_cache = (api_key, client)
+        client = openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=OPENROUTER_BASE_URL,
+            default_headers={
+                "HTTP-Referer": "https://github.com/tom100014/brownssocialmediaapp",
+                "X-Title": "Jarvis",
+            },
+        )
+        self._openrouter_client_cache = (api_key, client)
         return client
 
-    def _resolve_gemini_model(self) -> genai.GenerativeModel:
-        api_key = connectors_manager.get_credential("google_gemini", "api_key") or (
-            settings.google_api_key.get_secret_value() if settings.google_api_key else None
+    def _resolve_flash_model(self) -> str:
+        return connectors_manager.get_credential("openrouter", "flash_model") or connectors_manager.get_setting(
+            "gemini_model", settings.gemini_model
         )
-        if not api_key:
-            raise ProviderError(
-                "Kein Gemini-API-Key konfiguriert. Bitte Connector 'google_gemini' über "
-                "POST /connectors anlegen."
-            )
-        genai.configure(api_key=api_key)
-        model_name = connectors_manager.get_setting("gemini_model", settings.gemini_model)
-        return genai.GenerativeModel(model_name)
+
+    def _resolve_sonnet_model(self) -> str:
+        return connectors_manager.get_credential("openrouter", "sonnet_model") or connectors_manager.get_setting(
+            "claude_model", settings.claude_model
+        )
+
+    @staticmethod
+    def _to_openai_tools(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Konvertiert Anthropic-Tool-Schemas (name/description/input_schema) in das
+        OpenAI-Function-Calling-Format, das OpenRouter für alle Modelle einheitlich
+        erwartet."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema.get("description", ""),
+                    "parameters": schema.get("input_schema", {"type": "object", "properties": {}}),
+                },
+            }
+            for schema in tool_schemas
+        ]
 
     async def route(
         self,
@@ -285,7 +310,7 @@ class BrainRouter:
         response.latency_seconds = time.monotonic() - started
         return response
 
-    # -- Gemini Flash -----------------------------------------------------
+    # -- Flash-Pfad (schnelles Modell, kein Tool-Calling) --------------------
 
     async def _call_flash(self, user_input: str) -> BrainResponse:
         system_fragment = (
@@ -293,26 +318,32 @@ class BrainRouter:
             + self._context_loader.as_system_prompt_fragment()
             + self._memory_loader.as_system_prompt_fragment()
         )
-        prompt = f"{system_fragment}\n\nAnfrage des Master: {user_input}".strip()
-        gemini_model = self._resolve_gemini_model()
+        client = self._resolve_openrouter_client()
+        model = self._resolve_flash_model()
 
         try:
-            result = await asyncio.wait_for(
-                gemini_model.generate_content_async(prompt),
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_fragment},
+                    {"role": "user", "content": user_input},
+                ],
                 timeout=15.0,
             )
-        except asyncio.TimeoutError as exc:
-            raise ProviderError("Gemini Flash Timeout nach 15s.") from exc
-        except Exception as exc:  # google.api_core.exceptions.*
-            raise ProviderError(f"Gemini Flash Fehler: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise ProviderError(f"OpenRouter-Fehler ({exc.status_code}, {model}): {exc.message}") from exc
+        except openai.APIConnectionError as exc:
+            raise ProviderError(f"OpenRouter nicht erreichbar: {exc}") from exc
+        except openai.APITimeoutError as exc:
+            raise ProviderError(f"OpenRouter-Timeout ({model}) nach 15s.") from exc
 
-        text = getattr(result, "text", None)
+        text = response.choices[0].message.content if response.choices else None
         if not text:
-            raise ProviderError("Gemini Flash lieferte eine leere Antwort.")
+            raise ProviderError(f"Flash-Modell ({model}) lieferte eine leere Antwort.")
 
-        return BrainResponse(text=text.strip(), model_used=ModelTarget.FLASH, raw=result)
+        return BrainResponse(text=text.strip(), model_used=ModelTarget.FLASH, raw=response)
 
-    # -- Claude Sonnet (mit Tool-Calling) -----------------------------------
+    # -- Sonnet-Pfad (starkes Modell mit Tool-Calling) -----------------------
 
     async def _call_sonnet(
         self, user_input: str, conversation_history: list[dict[str, Any]]
@@ -323,31 +354,35 @@ class BrainRouter:
             + self._memory_loader.as_system_prompt_fragment()
         )
 
-        messages: list[dict[str, Any]] = [*conversation_history, {"role": "user", "content": user_input}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            *conversation_history,
+            {"role": "user", "content": user_input},
+        ]
         tool_calls_made: list[str] = []
-        anthropic_client = self._resolve_anthropic_client()
-        claude_model = connectors_manager.get_setting("claude_model", settings.claude_model)
+        client = self._resolve_openrouter_client()
+        model = self._resolve_sonnet_model()
+        openai_tools = self._to_openai_tools(self._tool_schemas) if self._tool_schemas else None
 
-        for iteration in range(self._max_tool_iterations):
+        for _ in range(self._max_tool_iterations):
             try:
-                response: AnthropicMessage = await anthropic_client.messages.create(
-                    model=claude_model,
-                    max_tokens=1024,
-                    system=system_prompt,
+                response = await client.chat.completions.create(
+                    model=model,
                     messages=messages,
-                    tools=self._tool_schemas or anthropic.NOT_GIVEN,
+                    tools=openai_tools,
+                    max_tokens=1024,
                 )
-            except anthropic.APIStatusError as exc:
-                raise ProviderError(f"Claude Sonnet API-Fehler ({exc.status_code}): {exc.message}") from exc
-            except anthropic.APIConnectionError as exc:
-                raise ProviderError(f"Claude Sonnet nicht erreichbar: {exc}") from exc
+            except openai.APIStatusError as exc:
+                raise ProviderError(f"OpenRouter-Fehler ({exc.status_code}, {model}): {exc.message}") from exc
+            except openai.APIConnectionError as exc:
+                raise ProviderError(f"OpenRouter nicht erreichbar: {exc}") from exc
 
-            if response.stop_reason != "tool_use":
-                final_text = "".join(
-                    block.text for block in response.content if block.type == "text"
-                )
+            choice = response.choices[0]
+            message = choice.message
+
+            if not message.tool_calls:
                 return BrainResponse(
-                    text=final_text.strip(),
+                    text=(message.content or "").strip(),
                     model_used=ModelTarget.SONNET,
                     tool_calls_made=tool_calls_made,
                     raw=response,
@@ -355,39 +390,37 @@ class BrainRouter:
 
             if self._tool_executor is None:
                 raise ProviderError(
-                    "Claude fordert Tool-Use an, aber es ist kein tool_executor konfiguriert."
+                    f"{model} fordert einen Tool-Call an, aber es ist kein tool_executor konfiguriert."
                 )
 
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results: list[dict[str, Any]] = []
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+            )
 
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                tool_calls_made.append(block.name)
+            for tool_call in message.tool_calls:
+                tool_calls_made.append(tool_call.function.name)
                 try:
-                    result = await self._tool_executor(block.name, block.input)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(result, ensure_ascii=False, default=str),
-                        }
-                    )
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                    result = await self._tool_executor(tool_call.function.name, arguments)
+                    content = json.dumps(result, ensure_ascii=False, default=str)
                 except Exception as exc:
-                    logger.exception("Tool '%s' fehlgeschlagen", block.name)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Fehler bei Tool-Ausführung: {exc}",
-                            "is_error": True,
-                        }
-                    )
+                    logger.exception("Tool '%s' fehlgeschlagen", tool_call.function.name)
+                    content = f"Fehler bei Tool-Ausführung: {exc}"
 
-            messages.append({"role": "user", "content": tool_results})
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
         else:
             raise ProviderError(
-                f"Tool-Use-Schleife nach {self._max_tool_iterations} Iterationen abgebrochen "
+                f"Tool-Call-Schleife nach {self._max_tool_iterations} Iterationen abgebrochen "
                 "(mögliche Endlosschleife)."
             )

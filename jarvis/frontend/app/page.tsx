@@ -162,14 +162,15 @@ export default function JarvisPage() {
           >
             🔊 Stimme
           </button>
-          {connected && baseUrl && (
+          {baseUrl && (
             <a
               href={`${baseUrl}/admin`}
               target="_blank"
               rel="noreferrer"
-              className="rounded-full border border-jarvis-border px-3 py-1.5 text-xs font-medium text-white/60 hover:text-white"
+              title="Backend-Einstellungen (Connectors, Modelle, Verlauf)"
+              className="flex items-center gap-1.5 rounded-full border border-jarvis-border px-3 py-1.5 text-xs font-medium text-white/60 hover:border-jarvis-accent/50 hover:text-jarvis-accent"
             >
-              ⚙ Connectors
+              🛠️ Admin
             </a>
           )}
           <button

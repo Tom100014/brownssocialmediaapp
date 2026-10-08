@@ -1,54 +1,34 @@
 {
-  "name": "brownssocialmediaapp",
-  "version": "1.0.0",
-  "description": "AI-Powered Video Synthesis & Social Media Automation - Clone videos with 100% identical flow",
-  "main": "index.js",
+  "name": "black-card-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "analyze": "node scripts/analyze-video.js",
-    "generate": "node scripts/generate-video.js",
-    "sync:tiktok": "node scripts/sync-tiktok.js",
-    "sync:instagram": "node scripts/sync-instagram.js"
+    "lint": "eslint"
   },
-  "keywords": [
-    "video-synthesis",
-    "social-media",
-    "ai-video",
-    "tiktok",
-    "instagram",
-    "face-swap",
-    "video-cloning",
-    "content-creation",
-    "google-omni",
-    "antigravity",
-    "mcp"
-  ],
-  "author": "Tom100014",
-  "license": "MIT",
   "dependencies": {
-    "next": "^15.0.0",
-    "react": "^19.0.0",
-    "typescript": "^5.3.3",
-    "tailwindcss": "^4.0.0",
-    "@anthropic-ai/sdk": "^0.9.0",
-    "@google-cloud/video-intelligence": "^4.11.0",
-    "@google-cloud/storage": "^7.0.0",
-    "firebase": "^10.7.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "axios": "^1.6.2",
-    "dotenv": "^16.3.1"
+    "@supabase/supabase-js": "^2.117.3",
+    "html5-qrcode": "^2.3.8",
+    "lucide-react": "^1.53.0",
+    "next": "16.4.0",
+    "qrcode": "^1.5.4",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "uuid": "^14.0.2"
   },
   "devDependencies": {
-    "@types/node": "^20.10.5",
-    "@types/react": "^18.2.45",
-    "eslint": "^8.55.0",
-    "prettier": "^3.1.1"
-  },
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
+    "@tailwindcss/turbopack": "^4",
+    "@types/node": "^20",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
   }
 }

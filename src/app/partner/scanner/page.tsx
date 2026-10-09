@@ -8,7 +8,7 @@ import { signOut, useProfile } from "@/lib/useProfile";
 import { Header, Loading } from "@/components/Shell";
 
 interface Partner { id: string; name: string }
-interface Result { ok: boolean; reason?: string; name?: string }
+interface Result { ok: boolean; reason?: string; name?: string; offer?: string }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -65,9 +65,10 @@ export default function Scanner() {
   return (
     <main className="pb-10">
       <Header title="Barista Scanner" onSignOut={signOut} />
+      <div className="mx-auto mb-3 max-w-md px-4"><a href="/partner" className="text-sm text-primary">← Zurück zum Betrieb</a></div>
       <div className="mx-auto max-w-md space-y-4 px-4">
         {partners.length === 0 ? (
-          <p className="glass rounded-2xl p-4 text-center text-sm text-white/60">Deinem Account ist kein aktiver Partner zugewiesen.</p>
+          <p className="glass rounded-2xl p-4 text-center text-sm text-white/60">Kein freigeschalteter Standort. Neue Betriebe müssen erst vom Admin freigegeben werden.</p>
         ) : (
           <select
             value={partnerId} onChange={(e) => setPartnerId(e.target.value)}
@@ -89,7 +90,7 @@ export default function Scanner() {
           <p className="text-4xl font-bold">{result.ok ? "FREIGEGEBEN" : "ABGELEHNT"}</p>
           {result.name && <p className="text-xl opacity-90">{result.name}</p>}
           {!result.ok && <p className="text-lg opacity-90">{result.reason}</p>}
-          {result.ok && <p className="text-lg opacity-90">Freigetränk ausgeben ✓</p>}
+          {result.ok && <p className="text-lg opacity-90">{result.offer ?? "Freigetränk"} ausgeben ✓</p>}
         </div>
       )}
     </main>

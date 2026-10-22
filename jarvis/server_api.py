@@ -322,6 +322,61 @@ async def list_tools() -> list[dict[str, Any]]:
     return tool_registry.schemas
 
 
+# --- Mitarbeiter-Verzehr (Personal-Tische) -------------------------------
+
+
+class StaffConsumptionRequest(BaseModel):
+    employee_name: str
+    table_number: int
+    items: str
+    full_value: float
+    discount_percent: float = 50
+    booking_date: Optional[str] = None
+
+
+@app.post("/staff-consumption", dependencies=[Depends(require_auth)])
+async def create_staff_consumption(request: StaffConsumptionRequest) -> dict[str, Any]:
+    try:
+        return await tool_registry.execute("book_staff_consumption", request.model_dump())
+    except ToolExecutionError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+
+@app.get("/staff-consumption", dependencies=[Depends(require_auth)])
+async def get_staff_consumption(
+    employee_name: Optional[str] = None, booking_date: Optional[str] = None
+) -> dict[str, Any]:
+    return await tool_registry.execute(
+        "list_staff_consumption", {"employee_name": employee_name, "booking_date": booking_date}
+    )
+
+
+@app.get("/staff-consumption/summary", dependencies=[Depends(require_auth)])
+async def get_staff_consumption_summary(booking_date: Optional[str] = None) -> dict[str, Any]:
+    """Pro Mitarbeiter aggregiert - die Basis für die anklickbaren Kästchen im
+    Dashboard: ein Kästchen pro Mitarbeiter mit Tagessumme, Klick zeigt die
+    Einzelbuchungen (siehe GET /staff-consumption?employee_name=...)."""
+    date = booking_date or datetime.now(timezone.utc).date().isoformat()
+    all_bookings = (await tool_registry.execute("list_staff_consumption", {"booking_date": date}))["bookings"]
+
+    by_employee: dict[str, dict[str, Any]] = {}
+    for booking in all_bookings:
+        entry = by_employee.setdefault(
+            booking["employee_name"],
+            {"employee_name": booking["employee_name"], "booking_count": 0, "total_full_value": 0.0, "total_staff_price": 0.0},
+        )
+        entry["booking_count"] += 1
+        entry["total_full_value"] += booking["full_value"]
+        entry["total_staff_price"] += booking["staff_price"]
+
+    for entry in by_employee.values():
+        entry["total_full_value"] = round(entry["total_full_value"], 2)
+        entry["total_staff_price"] = round(entry["total_staff_price"], 2)
+        entry["total_savings"] = round(entry["total_full_value"] - entry["total_staff_price"], 2)
+
+    return {"booking_date": date, "employees": sorted(by_employee.values(), key=lambda e: e["employee_name"])}
+
+
 # --- Voice-Endpunkte (dateibasiert, für Browser-/Frontend-Clients) ------
 #
 # Ergänzend zu audio_pipeline.AudioPipeline's Streaming-Methoden (gedacht für

@@ -564,7 +564,112 @@ async def recall_facts(query: Optional[str] = None) -> dict[str, Any]:
 
 
 # =========================================================================
-# 15. System-Check (echte Subprocess-Abfrage - KEINE Halluzination)
+# 15-16. Mitarbeiter-Verzehr (Personal-Tische)
+#
+# Bildet den Vorgang nach, den Browns Café bisher über BluePOS abwickelt:
+# ein Mitarbeiter bestellt an einem Tisch, der Vorgang wird als
+# Personal-Verzehr gebucht (standardmäßig 50 % Mitarbeiterrabatt) statt als
+# normaler Gästeumsatz. Deterministisch in SQLite - keine geratenen Beträge.
+# =========================================================================
+
+
+@tool(
+    {
+        "name": "book_staff_consumption",
+        "description": (
+            "Bucht einen Tisch als Mitarbeiter-Verzehr (Personal-Tisch), z. B. 'Tisch 1001 ist "
+            "Mitarbeiter Emona'. Berechnet standardmäßig 50% Mitarbeiterrabatt auf den Warenwert."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_name": {"type": "string", "description": "Name des Mitarbeiters, z. B. 'Emona'"},
+                "table_number": {"type": "integer", "description": "Tischnummer, z. B. 1001"},
+                "items": {"type": "string", "description": "Verzehrte Artikel, z. B. '1x Burger, 1x Cola'"},
+                "full_value": {"type": "number", "description": "Voller Warenwert in Euro (100%)"},
+                "discount_percent": {
+                    "type": "number",
+                    "description": "Mitarbeiterrabatt in Prozent",
+                    "default": 50,
+                },
+                "booking_date": {
+                    "type": "string",
+                    "description": "Datum im Format YYYY-MM-DD, Standard: heute",
+                },
+            },
+            "required": ["employee_name", "table_number", "items", "full_value"],
+        },
+    }
+)
+async def book_staff_consumption(
+    employee_name: str,
+    table_number: int,
+    items: str,
+    full_value: float,
+    discount_percent: float = 50,
+    booking_date: Optional[str] = None,
+) -> dict[str, Any]:
+    if full_value < 0:
+        raise ToolExecutionError("full_value darf nicht negativ sein.")
+    if not (0 <= discount_percent <= 100):
+        raise ToolExecutionError("discount_percent muss zwischen 0 und 100 liegen.")
+
+    date = booking_date or datetime.now(timezone.utc).date().isoformat()
+    staff_price = round(full_value * (1 - discount_percent / 100), 2)
+
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        INSERT INTO staff_consumption
+            (employee_name, table_number, items, full_value, staff_price, booking_date, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (employee_name, table_number, items, full_value, staff_price, date, _now_iso()),
+    )
+    conn.commit()
+    return {
+        "id": cursor.lastrowid,
+        "employee_name": employee_name,
+        "table_number": table_number,
+        "full_value": full_value,
+        "staff_price": staff_price,
+        "booking_date": date,
+        "status": "booked",
+    }
+
+
+@tool(
+    {
+        "name": "list_staff_consumption",
+        "description": "Listet gebuchten Mitarbeiter-Verzehr, optional gefiltert nach Mitarbeiter und/oder Datum.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_name": {"type": "string"},
+                "booking_date": {"type": "string", "description": "YYYY-MM-DD, Standard: alle Tage"},
+            },
+        },
+    }
+)
+async def list_staff_consumption(
+    employee_name: Optional[str] = None, booking_date: Optional[str] = None
+) -> dict[str, Any]:
+    conn = get_connection()
+    query = "SELECT * FROM staff_consumption WHERE 1=1"
+    params: list[Any] = []
+    if employee_name:
+        query += " AND employee_name = ?"
+        params.append(employee_name)
+    if booking_date:
+        query += " AND booking_date = ?"
+        params.append(booking_date)
+    query += " ORDER BY created_at DESC"
+    rows = conn.execute(query, params).fetchall()
+    return {"bookings": [dict(row) for row in rows]}
+
+
+# =========================================================================
+# 17. System-Check (echte Subprocess-Abfrage - KEINE Halluzination)
 # =========================================================================
 
 _SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.@-]+$")

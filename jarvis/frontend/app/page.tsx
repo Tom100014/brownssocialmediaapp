@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import ChatMessage, { Message } from "@/components/ChatMessage";
 import ConnectionModal from "@/components/ConnectionModal";
@@ -162,6 +163,15 @@ export default function JarvisPage() {
           >
             🔊 Stimme
           </button>
+          {connected && (
+            <Link
+              href="/mitarbeiter"
+              title="Mitarbeiter-Verzehr-Dashboard"
+              className="flex items-center gap-1.5 rounded-full border border-jarvis-border px-3 py-1.5 text-xs font-medium text-white/60 hover:border-jarvis-accent/50 hover:text-jarvis-accent"
+            >
+              🍽️ Verzehr
+            </Link>
+          )}
           {baseUrl && (
             <a
               href={`${baseUrl}/admin`}

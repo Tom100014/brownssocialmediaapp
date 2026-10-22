@@ -104,3 +104,55 @@ export async function transcribeAudio(blob: Blob): Promise<string> {
   if (!response.ok) throw new JarvisApiError(body?.detail || "Transkription fehlgeschlagen.");
   return body.text as string;
 }
+
+// --- Mitarbeiter-Verzehr --------------------------------------------------
+
+export interface StaffBooking {
+  id: number;
+  employee_name: string;
+  table_number: number;
+  items: string;
+  full_value: number;
+  staff_price: number;
+  booking_date: string;
+  created_at: string;
+}
+
+export interface StaffSummaryEntry {
+  employee_name: string;
+  booking_count: number;
+  total_full_value: number;
+  total_staff_price: number;
+  total_savings: number;
+}
+
+export interface StaffSummary {
+  booking_date: string;
+  employees: StaffSummaryEntry[];
+}
+
+export async function getStaffConsumptionSummary(bookingDate?: string): Promise<StaffSummary> {
+  const qs = bookingDate ? `?booking_date=${encodeURIComponent(bookingDate)}` : "";
+  return request<StaffSummary>(`/staff-consumption/summary${qs}`);
+}
+
+export async function getStaffConsumptionFor(employeeName: string): Promise<StaffBooking[]> {
+  const body = await request<{ bookings: StaffBooking[] }>(
+    `/staff-consumption?employee_name=${encodeURIComponent(employeeName)}`
+  );
+  return body.bookings;
+}
+
+export async function bookStaffConsumption(input: {
+  employee_name: string;
+  table_number: number;
+  items: string;
+  full_value: number;
+  discount_percent?: number;
+}): Promise<StaffBooking> {
+  return request<StaffBooking>("/staff-consumption", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}

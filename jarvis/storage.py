@@ -151,6 +151,22 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS staff_consumption (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_name  TEXT NOT NULL,
+            table_number   INTEGER NOT NULL,
+            items          TEXT NOT NULL,
+            full_value     REAL NOT NULL,
+            staff_price    REAL NOT NULL,
+            booking_date   TEXT NOT NULL,
+            created_at     TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_staff_consumption_date
+            ON staff_consumption(booking_date);
+        CREATE INDEX IF NOT EXISTS idx_staff_consumption_employee
+            ON staff_consumption(employee_name);
         """
     )
     conn.commit()
